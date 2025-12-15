@@ -1,0 +1,6 @@
+anthropic>=0.18.0
+azure-identity>=1.15.0
+azure-mgmt-apimanagement>=4.0.0
+azure-mgmt-cognitiveservices>=13.5.0
+azure-mgmt-resource>=23.0.0
+keyring>=24.0.0
