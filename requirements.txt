@@ -1,6 +1,13 @@
-anthropic>=0.18.0
+# Core Azure management
 azure-identity>=1.15.0
 azure-mgmt-apimanagement>=4.0.0
 azure-mgmt-cognitiveservices>=13.5.0
 azure-mgmt-resource>=23.0.0
+
+# AI analysis (prefer azure-ai-client for unified APIM key)
+azure-ai-client>=0.2.0
+anthropic>=0.18.0  # Fallback if azure-ai-client not available
+
+# Utilities
+requests>=2.28.0
 keyring>=24.0.0

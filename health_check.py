@@ -22,11 +22,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import anthropic
+import requests
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.apimanagement import ApiManagementClient
 from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
 from azure.mgmt.resource import ResourceManagementClient
+
+# Try to import azure-ai-client, fall back to anthropic
+try:
+    from azure_ai import AzureAIClient
+    USE_AZURE_AI_CLIENT = True
+except ImportError:
+    import anthropic
+    USE_AZURE_AI_CLIENT = False
 
 # Setup logging
 logging.basicConfig(
@@ -156,6 +164,8 @@ class APIMHealthChecker:
                     "protocols": api.protocols,
                     "subscription_required": api.subscription_required,
                     "api_version": api.api_version,
+                    "subscription_key_header_name": getattr(api, 'subscription_key_parameter_names', {}).get('header') if hasattr(api, 'subscription_key_parameter_names') and api.subscription_key_parameter_names else None,
+                    "subscription_key_query_name": getattr(api, 'subscription_key_parameter_names', {}).get('query') if hasattr(api, 'subscription_key_parameter_names') and api.subscription_key_parameter_names else None,
                 }
 
                 # Get API policy
@@ -315,7 +325,13 @@ class APIMHealthChecker:
             ))
 
         # Check APIs
+        api_header_names = set()
         for api in self.config.get("apis", []):
+            # Collect header names for consistency check
+            header_name = api.get("subscription_key_header_name")
+            if header_name:
+                api_header_names.add(header_name)
+
             # Check subscription requirement
             if not api.get("subscription_required"):
                 findings.append(Finding(
@@ -327,6 +343,19 @@ class APIMHealthChecker:
                     resource_name=api["name"],
                     recommendation="Enable subscription requirement for API access control",
                     details={"api_name": api["name"]}
+                ))
+
+            # Check subscription key header (prefer 'api-key' over 'Ocp-Apim-Subscription-Key')
+            if header_name and header_name.lower() == "ocp-apim-subscription-key":
+                findings.append(Finding(
+                    title="Using default APIM subscription header",
+                    description=f"API '{api['display_name']}' uses 'Ocp-Apim-Subscription-Key' header",
+                    severity=Severity.INFO,
+                    category=Category.OPERATIONS,
+                    resource_type="API",
+                    resource_name=api["name"],
+                    recommendation="Consider using 'api-key' header for consistency with Azure AI/OpenAI conventions",
+                    details={"api_name": api["name"], "current_header": header_name}
                 ))
 
             # Check for policies
@@ -413,6 +442,19 @@ class APIMHealthChecker:
                     recommendation="Configure API policies for security, rate limiting, and request/response transformation",
                     details={"api_name": api["name"]}
                 ))
+
+        # Check for inconsistent subscription key headers across APIs
+        if len(api_header_names) > 1:
+            findings.append(Finding(
+                title="Inconsistent subscription key headers",
+                description=f"APIs use different subscription key headers: {', '.join(api_header_names)}",
+                severity=Severity.MEDIUM,
+                category=Category.OPERATIONS,
+                resource_type="APIM",
+                resource_name=self.apim_name,
+                recommendation="Standardize on a single header name (recommend 'api-key') for all APIs for simpler client integration",
+                details={"headers_found": list(api_header_names)}
+            ))
 
         # Check backends
         for backend in self.config.get("backends", []):
@@ -527,10 +569,14 @@ class APIMHealthChecker:
 class AIFoundryHealthChecker:
     """Checks Azure AI Foundry/Cognitive Services health and best practices."""
 
-    def __init__(self, client: CognitiveServicesManagementClient, resource_group: str):
+    def __init__(self, client: CognitiveServicesManagementClient, resource_group: str,
+                 subscription_id: str, credential: DefaultAzureCredential):
         self.client = client
         self.resource_group = resource_group
+        self.subscription_id = subscription_id
+        self.credential = credential
         self.resources: List[Dict[str, Any]] = []
+        self.rai_policies: Dict[str, List[Dict[str, Any]]] = {}  # account_name -> policies
 
     def collect_configuration(self) -> List[Dict[str, Any]]:
         """Collect AI Services configuration for analysis."""
@@ -573,11 +619,64 @@ class AIFoundryHealthChecker:
 
                 self.resources.append(resource_config)
 
+                # Collect RAI policies for this account
+                try:
+                    policies = self._collect_rai_policies(account.name)
+                    self.rai_policies[account.name] = policies
+                    resource_config["rai_policies"] = policies
+                except Exception as e:
+                    logger.warning(f"Could not collect RAI policies for {account.name}: {e}")
+                    resource_config["rai_policies"] = []
+
         except Exception as e:
             logger.error(f"Error collecting AI Services configuration: {e}")
             raise
 
         return self.resources
+
+    def _collect_rai_policies(self, account_name: str) -> List[Dict[str, Any]]:
+        """Collect RAI (Responsible AI) content filter policies for an account."""
+        policies = []
+
+        try:
+            # Get access token for ARM API
+            token = self.credential.get_token("https://management.azure.com/.default")
+            headers = {"Authorization": f"Bearer {token.token}"}
+
+            url = (
+                f"https://management.azure.com/subscriptions/{self.subscription_id}"
+                f"/resourceGroups/{self.resource_group}"
+                f"/providers/Microsoft.CognitiveServices/accounts/{account_name}"
+                f"/raiPolicies?api-version=2024-10-01"
+            )
+
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                for policy in data.get("value", []):
+                    policy_config = {
+                        "name": policy.get("name"),
+                        "type": policy.get("properties", {}).get("type"),  # SystemManaged or UserManaged
+                        "mode": policy.get("properties", {}).get("mode"),  # Default or Blocking
+                        "base_policy": policy.get("properties", {}).get("basePolicyName"),
+                        "content_filters": [],
+                    }
+
+                    for cf in policy.get("properties", {}).get("contentFilters", []):
+                        policy_config["content_filters"].append({
+                            "name": cf.get("name"),
+                            "source": cf.get("source"),  # Prompt or Completion
+                            "enabled": cf.get("enabled", True),
+                            "blocking": cf.get("blocking", True),
+                            "severity_threshold": cf.get("severityThreshold"),
+                        })
+
+                    policies.append(policy_config)
+
+        except Exception as e:
+            logger.warning(f"Error fetching RAI policies for {account_name}: {e}")
+
+        return policies
 
     def check_health(self) -> List[Finding]:
         """Run health checks and return findings."""
@@ -696,18 +795,101 @@ class AIFoundryHealthChecker:
                     details={"resource": resource["name"]}
                 ))
 
-            # Note about content filtering (cannot be checked via API - needs Azure AI Studio)
+            # Check RAI (Content Filtering) policies
+            rai_policies = resource.get("rai_policies", [])
             if "openai" in kind or "aiservices" in kind:
+                if not rai_policies:
+                    findings.append(Finding(
+                        title="No custom content filter policies",
+                        description=f"AI Service '{resource['name']}' only uses default content filtering",
+                        severity=Severity.INFO,
+                        category=Category.COMPLIANCE,
+                        resource_type="AI Services",
+                        resource_name=resource["name"],
+                        recommendation="Review if default content filtering meets your requirements. Custom policies allow fine-tuning.",
+                        details={"resource": resource["name"]}
+                    ))
+                else:
+                    findings.extend(self._check_rai_policies(resource["name"], rai_policies))
+
+        return findings
+
+    def _check_rai_policies(self, resource_name: str, policies: List[Dict[str, Any]]) -> List[Finding]:
+        """Check RAI policies for security issues."""
+        findings = []
+
+        for policy in policies:
+            policy_name = policy.get("name", "unknown")
+
+            # Skip system-managed default policies
+            if policy.get("type") == "SystemManaged":
+                continue
+
+            content_filters = policy.get("content_filters", [])
+
+            # Check for disabled filters
+            disabled_filters = [cf for cf in content_filters if not cf.get("enabled", True)]
+            if disabled_filters:
+                filter_names = [cf["name"] for cf in disabled_filters]
                 findings.append(Finding(
-                    title="Content filtering review recommended",
-                    description=f"AI Service '{resource['name']}': Content filtering settings should be reviewed in Azure AI Studio",
+                    title="Content filters disabled",
+                    description=f"Policy '{policy_name}' has disabled filters: {', '.join(filter_names)}",
+                    severity=Severity.MEDIUM,
+                    category=Category.COMPLIANCE,
+                    resource_type="RAI Policy",
+                    resource_name=policy_name,
+                    recommendation="Ensure disabled filters are intentional and documented for compliance",
+                    details={"resource": resource_name, "policy": policy_name, "disabled_filters": filter_names}
+                ))
+
+            # Check for non-blocking filters (potential bypass)
+            non_blocking = [cf for cf in content_filters
+                           if cf.get("enabled", True) and not cf.get("blocking", True)]
+            if non_blocking:
+                filter_names = [cf["name"] for cf in non_blocking]
+                findings.append(Finding(
+                    title="Content filters set to non-blocking",
+                    description=f"Policy '{policy_name}' has non-blocking filters: {', '.join(filter_names)}. Content is flagged but not blocked.",
+                    severity=Severity.LOW,
+                    category=Category.COMPLIANCE,
+                    resource_type="RAI Policy",
+                    resource_name=policy_name,
+                    recommendation="Non-blocking mode logs violations but allows content through. Ensure this is intentional.",
+                    details={"resource": resource_name, "policy": policy_name, "non_blocking_filters": filter_names}
+                ))
+
+            # Check for permissive thresholds (High = most permissive)
+            high_threshold_filters = [cf for cf in content_filters
+                                      if cf.get("severity_threshold") == "High"
+                                      and cf.get("name") in ["Sexual", "Violence", "Hate", "Selfharm"]]
+            if high_threshold_filters:
+                filter_names = [cf["name"] for cf in high_threshold_filters]
+                findings.append(Finding(
+                    title="Content filters at maximum permissive threshold",
+                    description=f"Policy '{policy_name}' has 'High' threshold (most permissive) for: {', '.join(filter_names)}",
                     severity=Severity.INFO,
                     category=Category.COMPLIANCE,
-                    resource_type="AI Services",
-                    resource_name=resource["name"],
-                    recommendation="Review content filtering configuration in Azure AI Studio to ensure appropriate filters are enabled for your use case",
-                    details={"resource": resource["name"], "note": "Content filtering cannot be checked via ARM API"}
+                    resource_type="RAI Policy",
+                    resource_name=policy_name,
+                    recommendation="High threshold only blocks severe content. Consider Medium for stricter filtering if needed.",
+                    details={"resource": resource_name, "policy": policy_name, "high_threshold_filters": filter_names}
                 ))
+
+            # Check if Jailbreak protection is disabled
+            jailbreak_filters = [cf for cf in content_filters if cf.get("name") == "Jailbreak"]
+            if jailbreak_filters:
+                jb = jailbreak_filters[0]
+                if not jb.get("enabled", True):
+                    findings.append(Finding(
+                        title="Jailbreak protection disabled",
+                        description=f"Policy '{policy_name}' has jailbreak detection disabled",
+                        severity=Severity.MEDIUM,
+                        category=Category.SECURITY,
+                        resource_type="RAI Policy",
+                        resource_name=policy_name,
+                        recommendation="Jailbreak detection helps prevent prompt injection attacks. Enable unless you have specific reasons.",
+                        details={"resource": resource_name, "policy": policy_name}
+                    ))
 
         return findings
 
@@ -716,7 +898,17 @@ class ClaudeAnalyzer:
     """Uses Claude AI to analyze configurations and provide recommendations."""
 
     def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+        """
+        Initialize Claude analyzer.
+
+        Args:
+            api_key: APIM subscription key (if using azure-ai-client) or Anthropic API key
+        """
+        self.api_key = api_key
+        if USE_AZURE_AI_CLIENT:
+            self.client = AzureAIClient(api_key=api_key)
+        else:
+            self.client = anthropic.Anthropic(api_key=api_key)
 
     def analyze(
         self,
@@ -765,6 +957,7 @@ Please provide:
    - Network security
    - Data protection
    - Secret management
+   - Content filtering / RAI policies
 
 5. **Performance & Reliability** - Assessment of:
    - Scalability configuration
@@ -784,15 +977,23 @@ Format your response in clear markdown with headers and bullet points."""
 
         logger.info("Requesting Claude analysis...")
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        return response.content[0].text
+        if USE_AZURE_AI_CLIENT:
+            # Use azure-ai-client (routes through APIM)
+            return self.client.chat(
+                prompt,
+                model="claude-sonnet-4-5",  # Use deployment name
+                max_tokens=4096
+            )
+        else:
+            # Fall back to direct Anthropic SDK
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text
 
 
 def generate_html_report(result: HealthCheckResult, output_path: Path):
@@ -948,10 +1149,13 @@ def main():
 
     args = parser.parse_args()
 
-    # Check for Claude API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # Check for Claude API key (prefer AZURE_APIM_KEY for unified architecture)
+    api_key = os.environ.get("AZURE_APIM_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key and not args.skip_ai_analysis:
-        logger.warning("ANTHROPIC_API_KEY not set. Skipping AI analysis.")
+        if USE_AZURE_AI_CLIENT:
+            logger.warning("AZURE_APIM_KEY not set. Skipping AI analysis.")
+        else:
+            logger.warning("ANTHROPIC_API_KEY not set. Skipping AI analysis.")
         args.skip_ai_analysis = True
 
     # Initialize Azure clients
@@ -992,7 +1196,9 @@ def main():
     # Check AI Services
     try:
         ai_client = CognitiveServicesManagementClient(credential, args.subscription)
-        checker = AIFoundryHealthChecker(ai_client, args.resource_group)
+        checker = AIFoundryHealthChecker(
+            ai_client, args.resource_group, args.subscription, credential
+        )
         ai_services_config = checker.collect_configuration()
         findings = checker.check_health()
         for f in findings:

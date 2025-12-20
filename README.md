@@ -7,6 +7,7 @@ A comprehensive health check tool for Azure API Management (APIM) and Azure AI F
 - **Automated Health Checks** for:
   - Azure API Management (APIM)
   - Azure AI Services / Cognitive Services
+  - RAI (Responsible AI) Content Filter Policies
 
 - **Security Checks**:
   - Backend HTTPS and TLS certificate validation
@@ -16,14 +17,20 @@ A comprehensive health check tool for Azure API Management (APIM) and Azure AI F
   - Sensitive header stripping
   - Network security (VNet, Private Endpoints, IP restrictions)
   - Managed Identity configuration
+  - Content filtering / RAI policy configuration
 
 - **Reliability Checks**:
   - SKU recommendations
   - Availability Zones
   - Diagnostics configuration
 
+- **Operations Checks**:
+  - Subscription key header consistency (`api-key` vs `Ocp-Apim-Subscription-Key`)
+  - API header standardization across APIM
+
 - **AI-Powered Analysis**:
-  - Uses Claude API for intelligent analysis
+  - Uses `azure-ai-client` for Claude analysis (unified APIM key)
+  - Falls back to direct Anthropic SDK if needed
   - Context-aware recommendations
   - Azure Well-Architected Framework alignment
 
@@ -100,7 +107,16 @@ python health_check.py --subscription <sub-id> --resource-group <rg-name> --clau
 | No private endpoints | LOW | Security |
 | Dynamic throttling disabled | LOW | Performance |
 | Outbound network unrestricted | LOW | Security |
-| Content filtering review needed | INFO | Compliance |
+
+### RAI Policy Checks
+
+| Check | Severity | Category |
+|-------|----------|----------|
+| Content filters disabled | MEDIUM | Compliance |
+| Non-blocking content filters | LOW | Compliance |
+| High threshold (permissive) filters | INFO | Compliance |
+| Jailbreak protection disabled | MEDIUM | Security |
+| No custom content filter policies | INFO | Compliance |
 
 ## Health Score
 
@@ -117,9 +133,13 @@ The health score (0-100) is calculated based on finding severity:
 - **HTML**: Professional report with styling
 - **JSON**: Machine-readable format for automation
 
-## API Key Storage
+## API Key Configuration
 
-The GUI stores your Claude API key securely:
+Set one of the following environment variables for AI analysis:
+- `AZURE_APIM_KEY` - Preferred (uses unified APIM gateway via azure-ai-client)
+- `ANTHROPIC_API_KEY` - Fallback (direct Anthropic API)
+
+The GUI stores your API key securely:
 - **Windows**: Windows Credential Manager (via keyring)
 - **macOS**: Keychain
 - **Linux**: Secret Service
