@@ -157,6 +157,14 @@ class APIMHealthChecker:
             apis = list(self.client.api.list_by_service(self.resource_group, self.apim_name))
             self.config["apis"] = []
             for api in apis:
+                # Get subscription key parameter names (it's an object, not a dict)
+                sub_key_params = api.subscription_key_parameter_names
+                header_name = None
+                query_name = None
+                if sub_key_params:
+                    header_name = getattr(sub_key_params, 'header', None)
+                    query_name = getattr(sub_key_params, 'query', None)
+
                 api_config = {
                     "name": api.name,
                     "display_name": api.display_name,
@@ -164,8 +172,8 @@ class APIMHealthChecker:
                     "protocols": api.protocols,
                     "subscription_required": api.subscription_required,
                     "api_version": api.api_version,
-                    "subscription_key_header_name": getattr(api, 'subscription_key_parameter_names', {}).get('header') if hasattr(api, 'subscription_key_parameter_names') and api.subscription_key_parameter_names else None,
-                    "subscription_key_query_name": getattr(api, 'subscription_key_parameter_names', {}).get('query') if hasattr(api, 'subscription_key_parameter_names') and api.subscription_key_parameter_names else None,
+                    "subscription_key_header_name": header_name,
+                    "subscription_key_query_name": query_name,
                 }
 
                 # Get API policy
